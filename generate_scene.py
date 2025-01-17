@@ -12,7 +12,7 @@ parser.add_argument('--save_dir', default='./PC-FractalDB/3Dfractalscene', help=
 parser.add_argument('--numof_scene', type=int, default=10000, help='the number of 3D fractal scene')
 parser.add_argument('--numof_classes', type=int, default=1000, help='the number of fractal category')
 parser.add_argument('--numof_instance', type=int, default=1000, help='the number of intra-category')
-parser.add_argument('--numof_object', type=int, default=15, help='the average object per 3D fractal scene')
+parser.add_argument('--numof_object', type=int, default=50, help='the average object per 3D fractal scene')
 parser.add_argument('--scene_size', type=float, default=15.0, help='the size of 3D fractal scene')
 FLAGS = parser.parse_args()
 
@@ -23,6 +23,36 @@ NUM_OBJ = FLAGS.numof_object
 ROOM_SIZE = FLAGS.scene_size
 dump_dir = FLAGS.save_dir
 num_scenes = FLAGS.numof_scene
+# 地形フラクタル生成関数 (ランダムパラメータ対応)
+def generate_random_terrain():
+    size = np.random.choice([129, 257, 513])  # 地形のグリッドサイズ（ランダム選択）
+    scale = np.random.uniform(2.0, 10.0)      # 高さスケール（ランダム選択）
+    terrain = generate_terrain(size, scale)
+    return terrain, size, scale
+
+# 地物の密度をランダム化する関数
+def setRandomObjNum(avg_obj):
+    return avg_obj + int(np.random.poisson(lam=np.random.uniform(3, 10)))
+# シーンを生成する関数の修正
+def createOneSceneWithDensity(NUM_OBJ, terrain, room_size):
+    avg_obj = setObjNum(NUM_OBJ)  # 平均のオブジェクト数を設定
+    num_obj = setRandomObjNum(avg_obj)  # ランダムな密度でオブジェクト数を設定
+    objects = []
+
+    for obj_id in range(num_obj):
+        box = setOneObject(objects, terrain, room_size)
+        if box is None:
+            break
+        
+        obj = {}
+        obj["size"] = box["size"].tolist()
+        obj["c_pos"] = box["c_pos"].tolist()
+        obj["theta"] = (1.0 - np.random.random()*2.0) * np.pi
+        file_path = src_files[np.random.randint(0, len(src_files))]
+        obj["class_name"] = os.path.basename(os.path.dirname(file_path))
+        obj["file_name"] = os.path.basename(file_path)
+        objects.append(obj)
+    return objects
 
 def setObjNum(NUM_OBJ):
     return NUM_OBJ + int(np.floor(np.random.poisson(lam=5)))
@@ -53,8 +83,52 @@ def _checkInterpositionBox2(box1, box2):
     s1 = np.array(box1["size"][:2])
     s2 = np.array(box2["size"][:2])
     return np.linalg.norm(c1-c2) < (np.linalg.norm(s1) + np.linalg.norm(s2)) * 0.5 + 0.25
+# 地形フラクタル点群を生成
+def generate_terrain_point_cloud(terrain, room_size, resolution=0.1):
+    points = []
+    size = terrain.shape[0]
+    scale = room_size / (size - 1)
+    for i in range(size):
+        for j in range(size):
+            x = (i - size // 2) * scale
+            y = (j - size // 2) * scale
+            z = terrain[i, j]
+            points.append([x, y, z])
+    return np.array(points, dtype=np.float32)
 
+# load_object_point_cloud関数の修正
+def load_object_point_cloud(obj, src_dir, room_size, class_idx):
+    file_path = os.path.join(src_dir, obj["class_name"], obj["file_name"])
+    if not os.path.exists(file_path):
+        return None
 
+    # PLYファイルの読み込み
+    plydata = PlyData.read(file_path)
+    points = np.vstack([plydata['vertex']['x'], plydata['vertex']['y'], plydata['vertex']['z']]).T
+
+    # サイズ変更
+    points *= np.array(obj["size"])
+
+    # 回転 (Z軸回りの回転)
+    theta = obj["theta"]
+    rotation_matrix = np.array([
+        [np.cos(theta), -np.sin(theta), 0],
+        [np.sin(theta), np.cos(theta), 0],
+        [0, 0, 1]
+    ])
+    points = points @ rotation_matrix.T
+
+    # 平行移動
+    points += np.array(obj["c_pos"])
+
+    return points  # クラスIDは呼び出し側で追加する
+
+# 点群をPLYファイルとして保存
+def save_point_cloud_to_ply(file_path, points):
+    vertices = [(p[0], p[1], p[2], int(p[3])) for p in points]
+    vertex_element = PlyElement.describe(
+        np.array(vertices, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('class_id', 'i4')]), 'vertex')
+    PlyData([vertex_element], text=True).write(file_path)
 # 地形フラクタル生成関数 (ダイヤモンド-スクエア法)
 def generate_terrain(size, scale):
     terrain = np.zeros((size, size))
@@ -90,53 +164,6 @@ def generate_terrain(size, scale):
 
     return terrain
 
-# 地形フラクタル点群を生成
-def generate_terrain_point_cloud(terrain, room_size, resolution=0.1):
-    points = []
-    size = terrain.shape[0]
-    scale = room_size / (size - 1)
-    for i in range(size):
-        for j in range(size):
-            x = (i - size // 2) * scale
-            y = (j - size // 2) * scale
-            z = terrain[i, j]
-            points.append([x, y, z])
-    return np.array(points, dtype=np.float32)
-
-# オブジェクト点群を配置
-def load_object_point_cloud(obj, src_dir, room_size):
-    file_path = os.path.join(src_dir, obj["class_name"], obj["file_name"])
-    if not os.path.exists(file_path):
-        return None
-
-    # PLYファイルの読み込み
-    plydata = PlyData.read(file_path)
-    points = np.vstack([plydata['vertex']['x'], plydata['vertex']['y'], plydata['vertex']['z']]).T
-
-    # サイズ変更
-    points *= np.array(obj["size"])
-
-    # 回転 (Z軸回りの回転)
-    theta = obj["theta"]
-    rotation_matrix = np.array([
-        [np.cos(theta), -np.sin(theta), 0],
-        [np.sin(theta), np.cos(theta), 0],
-        [0, 0, 1]
-    ])
-    points = points @ rotation_matrix.T
-
-    # 平行移動
-    points += np.array(obj["c_pos"])
-
-    return points
-
-# 点群をPLYファイルとして保存
-def save_point_cloud_to_ply(file_path, points):
-    vertices = [(p[0], p[1], p[2]) for p in points]
-    vertex_element = PlyElement.describe(
-        np.array(vertices, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4')]), 'vertex')
-    PlyData([vertex_element], text=True).write(file_path)
-
 # 地形上の高さを取得する関数
 def get_height_from_terrain(terrain, x, y, room_size):
     size = terrain.shape[0]
@@ -165,7 +192,25 @@ def setOneObject(objects, terrain, room_size):
             return box
     return None
 
-# メイン関数の修正
+
+def createOneScene(NUM_OBJ):
+    num_obj = setObjNum(NUM_OBJ)
+    objects = []
+    for obj_id in range(num_obj):
+        box = setOneObject(objects)
+        if box is None:
+            break
+        
+        obj = {}
+        obj["size"] = box["size"].tolist()
+        obj["c_pos"] = box["c_pos"].tolist()
+        obj["theta"] = (1.0 - np.random.random()*2.0) * np.pi
+        file_path = src_files[np.random.randint(0, len(src_files))]
+        obj["class_name"] = os.path.basename(os.path.dirname(file_path))
+        obj["file_name"] = os.path.basename(file_path)
+        objects.append(obj)
+    return objects
+
 if __name__ == '__main__':
     if not os.path.exists(dump_dir):
         os.makedirs(dump_dir)
@@ -182,31 +227,45 @@ if __name__ == '__main__':
         os.mkdir(dump_dir)
         print("create", dump_dir)
 
-    # 地形フラクタル生成
-    terrain_size = 257  # 地形のグリッドサイズ
-    terrain_scale = 5.0  # 高さスケール
-    terrain = generate_terrain(terrain_size, terrain_scale)
-
-    # 地形点群生成
-    terrain_points = generate_terrain_point_cloud(terrain, ROOM_SIZE)
-
     for idx in range(num_scenes):
         print("\r%d/%d" % (idx + 1, num_scenes), end='')
+
+        # ランダムな地形生成
+        terrain, terrain_size, terrain_scale = generate_random_terrain()
+
+        # 地形点群生成
+        terrain_points = generate_terrain_point_cloud(terrain, ROOM_SIZE)
+
+        # 地形点群にクラスID列を追加（-1でクラス番号を示す）
+        terrain_class_ids = np.full((terrain_points.shape[0], 1), -1, dtype=np.int32)
+        scene_points = np.hstack([terrain_points, terrain_class_ids])
+
+        # シーンファイル名の設定
         file_name = os.path.join(dump_dir, "scene_%05d.json" % idx)
         ply_file_name = os.path.join(dump_dir, "scene_%05d.ply" % idx)
 
-        if os.path.exists(file_name):
-            # JSONファイルの読み込み
-            with open(file_name, 'r') as f:
-                objects = json.load(f)
+        # シーンに含まれるオブジェクト情報を生成
+        objects = createOneSceneWithDensity(NUM_OBJ, terrain, ROOM_SIZE)
 
-            # オブジェクトの点群を統合
-            scene_points = terrain_points.copy()
-            for obj in objects:
-                obj_points = load_object_point_cloud(obj, src_dir, ROOM_SIZE)
-                if obj_points is not None:
-                    scene_points = np.vstack([scene_points, obj_points])
+        # オブジェクトの点群を統合
+        for obj in objects:
+            class_idx = int(obj["class_name"])  # クラス番号を取得
+            obj_points = load_object_point_cloud(obj, src_dir, ROOM_SIZE, class_idx)
 
-            # 点群をPLYファイルとして保存
-            save_point_cloud_to_ply(ply_file_name, scene_points)
+            if obj_points is not None:
+                # オブジェクト点群にクラスID列を追加
+                obj_class_ids = np.full((obj_points.shape[0], 1), class_idx, dtype=np.int32)
+                obj_points_with_class = np.hstack([obj_points, obj_class_ids])
+                
+                # シーン点群に追加
+                scene_points = np.vstack([scene_points, obj_points_with_class])
+
+        # 点群をPLYファイルとして保存
+        save_point_cloud_to_ply(ply_file_name, scene_points)
+
+        # シーン情報をJSONファイルとして保存
+        with open(file_name, 'w') as f:
+            json.dump(objects, f, indent=4)
+
     print('')
+  
